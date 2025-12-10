@@ -1,0 +1,26 @@
+# Redpanda configuration
+# This file is optional for dev mode, but useful for production
+
+redpanda:
+  data_directory: /var/lib/redpanda/data
+  seed_servers: []
+  rpc_server:
+    address: 0.0.0.0
+    port: 33145
+  kafka_api:
+    - address: 0.0.0.0
+      port: 9092
+  admin:
+    - address: 0.0.0.0
+      port: 9644
+  developer_mode: true
+
+# Default topic configurations
+# (Topics will be auto-created, but this shows best practices)
+rpk:
+  kafka_api:
+    brokers:
+      - redpanda:9092
+  admin_api:
+    addresses:
+      - redpanda:9644
