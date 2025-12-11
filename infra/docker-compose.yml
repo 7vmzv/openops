@@ -71,9 +71,23 @@ services:
     networks:
       - openops-network
 
+  # Ollama - Local LLM service
+  ollama:
+    image: ollama/ollama:latest
+    container_name: openops-ollama
+    ports:
+      - "11434:11434"  # Ollama API
+    volumes:
+      - ollama-data:/root/.ollama
+    environment:
+      - OLLAMA_HOST=0.0.0.0
+    networks:
+      - openops-network
+
 networks:
   openops-network:
     driver: bridge
 
 volumes:
   qdrant-data:
+  ollama-data:
