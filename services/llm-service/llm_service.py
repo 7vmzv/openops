@@ -20,7 +20,6 @@ class LLMService:
         self.model = SentenceTransformer("all-MiniLM-L6-v2")
         self.qdrant = QdrantClient(host=qdrant_host, port=qdrant_port)
         
-        # Query type patterns
         self.query_patterns = {
             'error_analysis': ['error', 'fail', 'exception', 'crash', 'bug'],
             'performance': ['slow', 'timeout', 'latency', 'performance', 'response time'],
@@ -68,6 +67,11 @@ class LLMService:
             )
             
             logger.info(f"Found {len(results)} relevant logs for query: {query[:50]}...")
+            
+            for i, result in enumerate(results, 1):
+                log = result.payload
+                logger.info(f"  Log {i}: [{log['level']}] {log['service']}: {log['message'][:100]}... (score: {result.score:.3f})")
+            
             return results
             
         except Exception as e:
@@ -78,103 +82,21 @@ class LLMService:
         if not results:
             return "No relevant logs found."
         
-        context = f"Relevant logs (showing {len(results)} most similar):\n\n"
+        context = "Recent logs:\n"
         
         for i, result in enumerate(results, 1):
             log = result.payload
-            similarity = f"(similarity: {result.score:.2f})"
-            
-            if query_type == 'error_analysis':
-                context += f"{i}. [{log['level']}] {log['service']} at {log['timestamp'][:19]}\n"
-                context += f"   Error: {log['message']} {similarity}\n\n"
-            elif query_type == 'performance':
-                context += f"{i}. {log['service']} - {log['message']} {similarity}\n"
-                context += f"   Time: {log['timestamp'][:19]} | Level: {log['level']}\n\n"
-            else:
-                context += f"{i}. [{log['level']}] {log['service']}: {log['message']} {similarity}\n"
-                context += f"   Time: {log['timestamp'][:19]}\n\n"
+            context += f"{i}. [{log['level']}] {log['service']}: {log['message'][:80]}...\n"
         
         return context
     
     def _get_prompt_template(self, query_type: str, context: str, question: str) -> str:
-        base_instruction = "You are an expert DevOps engineer analyzing system logs."
-        
-        templates = {
-            'error_analysis': f"""{base_instruction}
-
-Analyze these error logs and provide insights:
+        return f"""You are a DevOps expert. Answer briefly.
 
 {context}
 
 Question: {question}
-
-Provide a clear analysis including:
-1. What errors are occurring
-2. Which services are affected
-3. Potential root causes
-4. Recommended actions
-
-Response:""",
-            
-            'performance': f"""{base_instruction}
-
-Analyze these performance-related logs:
-
-{context}
-
-Question: {question}
-
-Focus on:
-1. Performance patterns
-2. Bottlenecks or slow operations
-3. Impact on services
-4. Optimization suggestions
-
-Response:""",
-            
-            'security': f"""{base_instruction}
-
-Analyze these security-related logs:
-
-{context}
-
-Question: {question}
-
-Focus on:
-1. Security events
-2. Authentication/authorization issues
-3. Potential threats
-4. Security recommendations
-
-Response:""",
-            
-            'summary': f"""{base_instruction}
-
-Provide a summary of system activity:
-
-{context}
-
-Question: {question}
-
-Provide a concise summary covering:
-1. Overall system health
-2. Key events or patterns
-3. Services status
-4. Notable issues
-
-Response:"""
-        }
-        
-        return templates.get(query_type, f"""{base_instruction}
-
-Analyze these logs and answer the question:
-
-{context}
-
-Question: {question}
-
-Provide a clear, helpful response:
-""")
+Answer:"""
     
     def ask_llm(self, prompt: str, max_tokens: int = 500) -> str:
         try:
@@ -183,18 +105,22 @@ Provide a clear, helpful response:
                 "prompt": prompt,
                 "stream": False,
                 "options": {
-                    "num_predict": max_tokens,
-                    "temperature": 0.7,
-                    "top_p": 0.9
+                    "num_predict": 100,
+                    "temperature": 0.3
                 }
             }
             
             logger.info("Sending request to Ollama...")
-            response = requests.post(self.ollama_url, json=payload, timeout=30)
+            logger.info(f"Prompt length: {len(prompt)} chars")
+            logger.info(f"Prompt preview: {prompt[:200]}...")
+            
+            response = requests.post(self.ollama_url, json=payload, timeout=60)
             
             if response.status_code == 200:
                 result = response.json()
-                return result.get("response", "No response from LLM")
+                answer = result.get("response", "No response from LLM")
+                logger.info(f"Ollama response: {answer}")
+                return answer
             else:
                 logger.error(f"Ollama error: {response.status_code} - {response.text}")
                 return f"LLM service error: {response.status_code}"
