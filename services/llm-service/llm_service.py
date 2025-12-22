@@ -1,62 +1,289 @@
 #!/usr/bin/env python3
-"""
-Simple LLM Service with RAG
-"""
 
+import json
+import logging
 import requests
+from datetime import datetime, timedelta
+from typing import List, Dict, Optional
 from qdrant_client import QdrantClient
+from qdrant_client.models import Filter, FieldCondition, MatchValue
 from sentence_transformers import SentenceTransformer
 
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
 class LLMService:
-    def __init__(self):
+    def __init__(self, ollama_host="localhost:11434", qdrant_host="localhost", qdrant_port=6333):
+        logger.info("Initializing LLM Service...")
+        
+        self.ollama_url = f"http://{ollama_host}/api/generate"
         self.model = SentenceTransformer("all-MiniLM-L6-v2")
-        self.qdrant = QdrantClient(host="localhost", port=6333)
-    
-    def search_logs(self, query, limit=5):
-        """Find relevant logs"""
-        vector = self.model.encode(query).tolist()
-        return self.qdrant.search(
-            collection_name="logs",
-            query_vector=vector,
-            limit=limit
-        )
-    
-    def ask_llm(self, prompt):
-        """Get response from Ollama"""
-        response = requests.post(
-            "http://localhost:11434/api/generate",
-            json={"model": "llama3.2:1b", "prompt": prompt, "stream": False}
-        )
-        return response.json()["response"] if response.status_code == 200 else "Error"
-    
-    def query(self, question):
-        """Main RAG function"""
-        # Get relevant logs
-        results = self.search_logs(question, limit=3)
+        self.qdrant = QdrantClient(host=qdrant_host, port=qdrant_port)
         
+        # Query type patterns
+        self.query_patterns = {
+            'error_analysis': ['error', 'fail', 'exception', 'crash', 'bug'],
+            'performance': ['slow', 'timeout', 'latency', 'performance', 'response time'],
+            'security': ['auth', 'login', 'permission', 'unauthorized', 'security'],
+            'deployment': ['deploy', 'release', 'version', 'rollback'],
+            'summary': ['summary', 'overview', 'what happened', 'status']
+        }
+        
+        logger.info("LLM Service initialized")
+    
+    def _detect_query_type(self, question: str) -> str:
+        question_lower = question.lower()
+        
+        for query_type, keywords in self.query_patterns.items():
+            if any(keyword in question_lower for keyword in keywords):
+                return query_type
+        
+        return 'general'
+    
+    def search_logs(self, query: str, limit: int = 5, time_filter: Optional[str] = None, 
+                   service_filter: Optional[str] = None, level_filter: Optional[str] = None) -> List:
+        try:
+            vector = self.model.encode(query).tolist()
+            
+            filters = []
+            
+            if time_filter:
+                hours = {'1h': 1, '24h': 24, '7d': 168}.get(time_filter, 24)
+                cutoff = (datetime.utcnow() - timedelta(hours=hours)).isoformat() + "Z"
+                filters.append(FieldCondition(key="timestamp", range={"gte": cutoff}))
+            
+            if service_filter:
+                filters.append(FieldCondition(key="service", match=MatchValue(value=service_filter)))
+            
+            if level_filter:
+                filters.append(FieldCondition(key="level", match=MatchValue(value=level_filter)))
+            
+            search_filter = Filter(must=filters) if filters else None
+            
+            results = self.qdrant.search(
+                collection_name="logs",
+                query_vector=vector,
+                limit=limit,
+                query_filter=search_filter
+            )
+            
+            logger.info(f"Found {len(results)} relevant logs for query: {query[:50]}...")
+            return results
+            
+        except Exception as e:
+            logger.error(f"Error searching logs: {e}")
+            return []
+    
+    def _build_context(self, results: List, query_type: str) -> str:
         if not results:
-            return "No relevant logs found"
+            return "No relevant logs found."
         
-        # Build context
-        context = "Recent logs:\n"
+        context = f"Relevant logs (showing {len(results)} most similar):\n\n"
+        
         for i, result in enumerate(results, 1):
             log = result.payload
-            context += f"{i}. [{log['level']}] {log['service']}: {log['message']}\n"
+            similarity = f"(similarity: {result.score:.2f})"
+            
+            if query_type == 'error_analysis':
+                context += f"{i}. [{log['level']}] {log['service']} at {log['timestamp'][:19]}\n"
+                context += f"   Error: {log['message']} {similarity}\n\n"
+            elif query_type == 'performance':
+                context += f"{i}. {log['service']} - {log['message']} {similarity}\n"
+                context += f"   Time: {log['timestamp'][:19]} | Level: {log['level']}\n\n"
+            else:
+                context += f"{i}. [{log['level']}] {log['service']}: {log['message']} {similarity}\n"
+                context += f"   Time: {log['timestamp'][:19]}\n\n"
         
-        # Create prompt
-        prompt = f"""You are a DevOps expert. Analyze these logs and answer the question.
+        return context
+    
+    def _get_prompt_template(self, query_type: str, context: str, question: str) -> str:
+        base_instruction = "You are an expert DevOps engineer analyzing system logs."
+        
+        templates = {
+            'error_analysis': f"""{base_instruction}
+
+Analyze these error logs and provide insights:
 
 {context}
 
 Question: {question}
 
-Answer briefly and clearly:"""
-        
-        return self.ask_llm(prompt)
+Provide a clear analysis including:
+1. What errors are occurring
+2. Which services are affected
+3. Potential root causes
+4. Recommended actions
 
-if __name__ == "__main__":
+Response:""",
+            
+            'performance': f"""{base_instruction}
+
+Analyze these performance-related logs:
+
+{context}
+
+Question: {question}
+
+Focus on:
+1. Performance patterns
+2. Bottlenecks or slow operations
+3. Impact on services
+4. Optimization suggestions
+
+Response:""",
+            
+            'security': f"""{base_instruction}
+
+Analyze these security-related logs:
+
+{context}
+
+Question: {question}
+
+Focus on:
+1. Security events
+2. Authentication/authorization issues
+3. Potential threats
+4. Security recommendations
+
+Response:""",
+            
+            'summary': f"""{base_instruction}
+
+Provide a summary of system activity:
+
+{context}
+
+Question: {question}
+
+Provide a concise summary covering:
+1. Overall system health
+2. Key events or patterns
+3. Services status
+4. Notable issues
+
+Response:"""
+        }
+        
+        return templates.get(query_type, f"""{base_instruction}
+
+Analyze these logs and answer the question:
+
+{context}
+
+Question: {question}
+
+Provide a clear, helpful response:
+""")
+    
+    def ask_llm(self, prompt: str, max_tokens: int = 500) -> str:
+        try:
+            payload = {
+                "model": "llama3.2:1b",
+                "prompt": prompt,
+                "stream": False,
+                "options": {
+                    "num_predict": max_tokens,
+                    "temperature": 0.7,
+                    "top_p": 0.9
+                }
+            }
+            
+            logger.info("Sending request to Ollama...")
+            response = requests.post(self.ollama_url, json=payload, timeout=30)
+            
+            if response.status_code == 200:
+                result = response.json()
+                return result.get("response", "No response from LLM")
+            else:
+                logger.error(f"Ollama error: {response.status_code} - {response.text}")
+                return f"LLM service error: {response.status_code}"
+                
+        except requests.exceptions.Timeout:
+            logger.error("Ollama request timeout")
+            return "Request timeout - LLM service may be overloaded"
+        except requests.exceptions.ConnectionError:
+            logger.error("Cannot connect to Ollama")
+            return "Cannot connect to LLM service - is Ollama running?"
+        except Exception as e:
+            logger.error(f"Unexpected error: {e}")
+            return f"Unexpected error: {str(e)}"
+    
+    def query(self, question: str, limit: int = 5, time_filter: Optional[str] = None,
+             service_filter: Optional[str] = None, level_filter: Optional[str] = None) -> Dict:
+        logger.info(f"Processing query: {question}")
+        
+        query_type = self._detect_query_type(question)
+        logger.info(f"Detected query type: {query_type}")
+        
+        results = self.search_logs(question, limit, time_filter, service_filter, level_filter)
+        
+        if not results:
+            return {
+                "answer": "No relevant logs found for your query.",
+                "query_type": query_type,
+                "logs_found": 0,
+                "filters_applied": {
+                    "time": time_filter,
+                    "service": service_filter,
+                    "level": level_filter
+                }
+            }
+        
+        context = self._build_context(results, query_type)
+        prompt = self._get_prompt_template(query_type, context, question)
+        
+        answer = self.ask_llm(prompt)
+        
+        return {
+            "answer": answer,
+            "query_type": query_type,
+            "logs_found": len(results),
+            "context_logs": [
+                {
+                    "service": r.payload["service"],
+                    "level": r.payload["level"],
+                    "message": r.payload["message"][:100] + "..." if len(r.payload["message"]) > 100 else r.payload["message"],
+                    "timestamp": r.payload["timestamp"],
+                    "similarity": round(r.score, 3)
+                } for r in results
+            ],
+            "filters_applied": {
+                "time": time_filter,
+                "service": service_filter,
+                "level": level_filter
+            }
+        }
+
+def main():
     service = LLMService()
     
-    # Test
-    response = service.query("What database errors are happening?")
-    print(response)
+    test_queries = [
+        "What database errors are happening?",
+        "Show me performance issues in the last hour",
+        "Any authentication failures?",
+        "Summarize system status"
+    ]
+    
+    print("=" * 60)
+    print("OpenOps Enhanced LLM Service Test")
+    print("=" * 60)
+    
+    for query in test_queries:
+        print(f"\nQuery: {query}")
+        print("-" * 40)
+        
+        result = service.query(query, limit=3)
+        print(f"Answer: {result['answer']}")
+        print(f"Query Type: {result['query_type']}")
+        print(f"Logs Found: {result['logs_found']}")
+        
+        if result['context_logs']:
+            print("\nRelevant Logs:")
+            for i, log in enumerate(result['context_logs'], 1):
+                print(f"  {i}. [{log['level']}] {log['service']}: {log['message']} (sim: {log['similarity']})")
+        
+        print("\n" + "=" * 60)
+
+if __name__ == "__main__":
+    main()
