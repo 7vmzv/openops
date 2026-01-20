@@ -17,6 +17,13 @@ class Settings:
     QDRANT_HOST: str = os.getenv("QDRANT_HOST", "localhost")
     QDRANT_PORT: int = int(os.getenv("QDRANT_PORT", "6333"))
     
+    # TimescaleDB Configuration
+    TIMESCALE_HOST: str = os.getenv("TIMESCALE_HOST", "localhost")
+    TIMESCALE_PORT: int = int(os.getenv("TIMESCALE_PORT", "5432"))
+    TIMESCALE_DB: str = os.getenv("TIMESCALE_DB", "openops")
+    TIMESCALE_USER: str = os.getenv("TIMESCALE_USER", "openops")
+    TIMESCALE_PASSWORD: str = os.getenv("TIMESCALE_PASSWORD", "openops123")
+    
     # LLM Service Configuration
     LLM_SERVICE_TIMEOUT: int = int(os.getenv("LLM_SERVICE_TIMEOUT", "30"))
     DEFAULT_SEARCH_LIMIT: int = int(os.getenv("DEFAULT_SEARCH_LIMIT", "5"))

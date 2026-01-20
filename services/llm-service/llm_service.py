@@ -8,9 +8,134 @@ from typing import List, Dict, Optional
 from qdrant_client import QdrantClient
 from qdrant_client.models import Filter, FieldCondition, MatchValue
 from sentence_transformers import SentenceTransformer
+import psycopg2
+from psycopg2.extras import RealDictCursor
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+# Configuration
+TIMESCALE_HOST = "localhost"
+TIMESCALE_PORT = 5432
+TIMESCALE_DB = "openops"
+TIMESCALE_USER = "openops"
+TIMESCALE_PASSWORD = "openops123"
+
+
+class SimpleMetricsService:
+    """Lightweight metrics service for LLM integration"""
+    
+    def __init__(self):
+        try:
+            self.conn = psycopg2.connect(
+                host=TIMESCALE_HOST,
+                port=TIMESCALE_PORT,
+                database=TIMESCALE_DB,
+                user=TIMESCALE_USER,
+                password=TIMESCALE_PASSWORD,
+                cursor_factory=RealDictCursor
+            )
+        except Exception as e:
+            logger.error(f"Failed to connect to TimescaleDB: {e}")
+            self.conn = None
+    
+    def get_error_rate(self, service: str, hours: int = 1) -> float:
+        if not self.conn:
+            return 0.0
+        
+        try:
+            with self.conn.cursor() as cursor:
+                cursor.execute("""
+                    SELECT 
+                        COALESCE(SUM(error_count), 0) as total_errors,
+                        COALESCE(SUM(log_count), 0) as total_logs
+                    FROM log_metrics 
+                    WHERE service = %s 
+                    AND time > NOW() - INTERVAL '%s hours'
+                """, (service, hours))
+                
+                result = cursor.fetchone()
+                if result['total_logs'] == 0:
+                    return 0.0
+                
+                return (result['total_errors'] / result['total_logs']) * 100
+        except Exception as e:
+            logger.error(f"Error getting error rate: {e}")
+            return 0.0
+    
+    def get_service_summary(self, hours: int = 1) -> List[dict]:
+        if not self.conn:
+            return []
+        
+        try:
+            with self.conn.cursor() as cursor:
+                cursor.execute("""
+                    SELECT 
+                        service,
+                        SUM(log_count) as total_logs,
+                        SUM(error_count) as total_errors,
+                        CASE 
+                            WHEN SUM(log_count) > 0 
+                            THEN (SUM(error_count)::float / SUM(log_count)) * 100 
+                            ELSE 0 
+                        END as error_rate
+                    FROM log_metrics 
+                    WHERE time > NOW() - INTERVAL '%s hours'
+                    GROUP BY service
+                    ORDER BY error_rate DESC
+                """, (hours,))
+                
+                return [dict(row) for row in cursor.fetchall()]
+        except Exception as e:
+            logger.error(f"Error getting service summary: {e}")
+            return []
+    
+    def detect_spike(self, service: str, threshold: float = 2.0) -> Optional[dict]:
+        """Detect if current error rate is a spike"""
+        if not self.conn:
+            return None
+        
+        try:
+            # Get current rate (last 10 minutes)
+            current_rate = self.get_error_rate(service, hours=0.17)
+            
+            # Get baseline (last 24 hours, excluding recent)
+            with self.conn.cursor() as cursor:
+                cursor.execute("""
+                    SELECT AVG(
+                        CASE 
+                            WHEN log_count > 0 
+                            THEN (error_count::float / log_count) * 100 
+                            ELSE 0 
+                        END
+                    ) as baseline_rate
+                    FROM log_metrics 
+                    WHERE service = %s 
+                    AND time > NOW() - INTERVAL '24 hours'
+                    AND time < NOW() - INTERVAL '1 hour'
+                """, (service,))
+                
+                result = cursor.fetchone()
+                baseline_rate = result['baseline_rate'] or 0.0
+            
+            if baseline_rate == 0 or current_rate == 0:
+                return None
+            
+            spike_ratio = current_rate / baseline_rate
+            
+            if spike_ratio >= threshold:
+                return {
+                    'service': service,
+                    'current_rate': current_rate,
+                    'baseline_rate': baseline_rate,
+                    'spike_ratio': spike_ratio,
+                    'severity': 'HIGH' if spike_ratio >= 5 else 'MEDIUM'
+                }
+            
+            return None
+        except Exception as e:
+            logger.error(f"Error detecting spike for {service}: {e}")
+            return None
 
 class LLMService:
     def __init__(self, ollama_host="localhost:11434", qdrant_host="localhost", qdrant_port=6333):
@@ -20,12 +145,16 @@ class LLMService:
         self.model = SentenceTransformer("all-MiniLM-L6-v2")
         self.qdrant = QdrantClient(host=qdrant_host, port=qdrant_port)
         
+        self.metrics = SimpleMetricsService()
+        
         self.query_patterns = {
             'error_analysis': ['error', 'fail', 'exception', 'crash', 'bug'],
             'performance': ['slow', 'timeout', 'latency', 'performance', 'response time'],
             'security': ['auth', 'login', 'permission', 'unauthorized', 'security'],
             'deployment': ['deploy', 'release', 'version', 'rollback'],
-            'summary': ['summary', 'overview', 'what happened', 'status']
+            'summary': ['summary', 'overview', 'what happened', 'status'],
+            'anomaly': ['unusual', 'pattern', 'spike', 'anomaly', 'baseline', 'abnormal'],
+            'metrics': ['rate', 'trend', 'metric', 'performance']
         }
         
         logger.info("LLM Service initialized")
@@ -78,7 +207,7 @@ class LLMService:
             logger.error(f"Error searching logs: {e}")
             return []
     
-    def _build_context(self, results: List, query_type: str) -> str:
+    def _build_context(self, results: List, query_type: str, service_filter: Optional[str] = None) -> str:
         if not results:
             return "No relevant logs found."
         
@@ -88,10 +217,65 @@ class LLMService:
             log = result.payload
             context += f"{i}. [{log['level']}] {log['service']}: {log['message'][:80]}...\n"
         
+        # Add metrics context if available
+        if service_filter:
+            metrics_context = self._get_metrics_context(service_filter)
+            if metrics_context:
+                context += f"\nMetrics for {service_filter}:\n{metrics_context}"
+        else:
+            # Get summary for all services
+            summary_context = self._get_summary_metrics()
+            if summary_context:
+                context += f"\nSystem metrics:\n{summary_context}"
+        
         return context
     
+    def _get_metrics_context(self, service: str) -> str:
+        """Get metrics context for a specific service"""
+        try:
+            error_rate = self.metrics.get_error_rate(service, hours=1)
+            spike = self.metrics.detect_spike(service)
+            
+            context = f"Error rate (last hour): {error_rate:.1f}%"
+            
+            if spike:
+                context += f"\n🚨 SPIKE DETECTED: {spike['spike_ratio']:.1f}x baseline ({spike['severity']})"
+            
+            return context
+        except Exception as e:
+            logger.error(f"Error getting metrics for {service}: {e}")
+            return ""
+    
+    def _get_summary_metrics(self) -> str:
+        """Get summary metrics for all services"""
+        try:
+            summary = self.metrics.get_service_summary(hours=1)
+            if not summary:
+                return ""
+            
+            context = "Service error rates (last hour):\n"
+            anomalies = []
+            
+            for service in summary[:5]:  # Top 5 services
+                context += f"  {service['service']}: {service['error_rate']:.1f}% ({service['total_logs']} logs)\n"
+                
+                # Check for spikes
+                spike = self.metrics.detect_spike(service['service'])
+                if spike:
+                    anomalies.append(f"🚨 {service['service']}: {spike['spike_ratio']:.1f}x baseline ({spike['severity']})")
+            
+            if anomalies:
+                context += "\nAnomalies detected:\n"
+                for anomaly in anomalies:
+                    context += f"  {anomaly}\n"
+            
+            return context
+        except Exception as e:
+            logger.error(f"Error getting summary metrics: {e}")
+            return ""
+    
     def _get_prompt_template(self, query_type: str, context: str, question: str) -> str:
-        return f"""You are a DevOps expert. Answer briefly.
+        return f"""You are a DevOps expert analyzing system logs and metrics. Answer briefly and focus on actionable insights.
 
 {context}
 
@@ -114,7 +298,7 @@ Answer:"""
             logger.info(f"Prompt length: {len(prompt)} chars")
             logger.info(f"Prompt preview: {prompt[:200]}...")
             
-            response = requests.post(self.ollama_url, json=payload, timeout=60)
+            response = requests.post(self.ollama_url, json=payload, timeout=120)
             
             if response.status_code == 200:
                 result = response.json()
@@ -156,7 +340,7 @@ Answer:"""
                 }
             }
         
-        context = self._build_context(results, query_type)
+        context = self._build_context(results, query_type, service_filter)
         prompt = self._get_prompt_template(query_type, context, question)
         
         answer = self.ask_llm(prompt)

@@ -10,7 +10,7 @@ from datetime import datetime
 
 from .config import settings
 from .models import ErrorResponse
-from .routers import health, query, search
+from .routers import health, query, search, metrics
 
 # Configure logging
 logging.basicConfig(level=getattr(logging, settings.LOG_LEVEL))
@@ -67,6 +67,7 @@ app.add_middleware(
 app.include_router(health.router)
 app.include_router(query.router)
 app.include_router(search.router)
+app.include_router(metrics.router)
 
 # Global exception handler
 @app.exception_handler(Exception)

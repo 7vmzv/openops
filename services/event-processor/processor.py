@@ -5,11 +5,14 @@ Consumes logs from Kafka, generates embeddings, and stores in Qdrant
 """
 
 import json
-from datetime import datetime
+from datetime import datetime, timedelta
+from collections import defaultdict
 from kafka import KafkaConsumer
 from qdrant_client import QdrantClient
 from qdrant_client.models import Distance, VectorParams, PointStruct
 from sentence_transformers import SentenceTransformer
+import psycopg2
+from psycopg2.extras import RealDictCursor
 
 # Configuration
 KAFKA_BROKER = "localhost:19092"
@@ -20,8 +23,18 @@ QDRANT_HOST = "localhost"
 QDRANT_PORT = 6333
 QDRANT_COLLECTION = "logs"
 
+# TimescaleDB Configuration
+TIMESCALE_HOST = "localhost"
+TIMESCALE_PORT = 5432
+TIMESCALE_DB = "openops"
+TIMESCALE_USER = "openops"
+TIMESCALE_PASSWORD = "openops123"
+
 # Embedding model (lightweight and fast)
 EMBEDDING_MODEL = "all-MiniLM-L6-v2"  # 384 dimensions
+
+# Metrics aggregation window (in seconds)
+METRICS_WINDOW = 60  # 1 minute
 
 
 class EventProcessor:
@@ -42,6 +55,18 @@ class EventProcessor:
         # Create collection if it doesn't exist
         self._setup_collection()
         
+        # Initialize TimescaleDB connection
+        print(f"Connecting to TimescaleDB at {TIMESCALE_HOST}:{TIMESCALE_PORT}")
+        self.timescale_conn = psycopg2.connect(
+            host=TIMESCALE_HOST,
+            port=TIMESCALE_PORT,
+            database=TIMESCALE_DB,
+            user=TIMESCALE_USER,
+            password=TIMESCALE_PASSWORD
+        )
+        self.timescale_conn.autocommit = True
+        print("TimescaleDB connected")
+        
         # Initialize Kafka consumer
         print(f"Connecting to Kafka at {KAFKA_BROKER}")
         self.consumer = KafkaConsumer(
@@ -52,6 +77,10 @@ class EventProcessor:
             auto_offset_reset='earliest',
             enable_auto_commit=True,
         )
+        
+        # Metrics buffer for aggregation
+        self.metrics_buffer = defaultdict(lambda: defaultdict(int))
+        self.last_flush = datetime.now()
         
         print("Initialization complete\n")
     
@@ -102,7 +131,48 @@ class EventProcessor:
             points=[point]
         )
         
+        # Update metrics buffer
+        self._update_metrics(log)
+        
         return point.id
+    
+    def _update_metrics(self, log):
+        """Update metrics buffer with log data"""
+        service = log['service']
+        level = log['level']
+        
+        # Increment counters
+        self.metrics_buffer[service]['log_count'] += 1
+        
+        if level == 'ERROR':
+            self.metrics_buffer[service]['error_count'] += 1
+        elif level == 'WARNING':
+            self.metrics_buffer[service]['warning_count'] += 1
+    
+    def _flush_metrics(self):
+        """Flush metrics buffer to TimescaleDB"""
+        if not self.metrics_buffer:
+            return
+        
+        current_time = datetime.now()
+        
+        with self.timescale_conn.cursor() as cursor:
+            for service, metrics in self.metrics_buffer.items():
+                cursor.execute("""
+                    INSERT INTO log_metrics (time, service, level, log_count, error_count, warning_count)
+                    VALUES (%s, %s, 'ALL', %s, %s, %s)
+                """, (
+                    current_time,
+                    service,
+                    metrics['log_count'],
+                    metrics['error_count'],
+                    metrics['warning_count']
+                ))
+        
+        # Clear buffer
+        self.metrics_buffer.clear()
+        self.last_flush = current_time
+        print(f"Metrics flushed to TimescaleDB at {current_time.strftime('%H:%M:%S')}")
     
     def run(self):
         """Main processing loop"""
@@ -119,13 +189,20 @@ class EventProcessor:
                 point_id = self.process_log(log)
                 count += 1
                 
+                # Flush metrics every minute
+                if (datetime.now() - self.last_flush).seconds >= METRICS_WINDOW:
+                    self._flush_metrics()
+                
                 # Print progress every 10 logs
                 if count % 10 == 0:
                     print(f"Processed {count} logs | Last: [{log['level']}] {log['service']}: {log['message'][:50]}...")
                 
         except KeyboardInterrupt:
             print(f"\n\nStopping processor... (processed {count} logs)")
+            # Flush remaining metrics
+            self._flush_metrics()
             self.consumer.close()
+            self.timescale_conn.close()
             print("Processor stopped cleanly")
 
 
